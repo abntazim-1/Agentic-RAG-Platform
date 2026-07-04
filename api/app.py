@@ -45,6 +45,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config import get_settings
 from models import QueryRequest, QueryResponse
 from ingestion.loaders import load_directory, load_file
@@ -59,6 +63,11 @@ from reranking.reranker import Reranker, ContextCompressor
 from memory.conversation import ConversationMemory
 from evaluation.evaluator import EmbeddingEvaluator
 from agent.graph import build_simple_graph
+from db.database import init_db, get_db
+from sqlalchemy.orm import Session
+
+# Initialize Database
+init_db()
 
 settings = get_settings()
 
@@ -96,7 +105,17 @@ class EvalReq(BaseModel):
     ground_truths: list[str] = []
 
 # ─── FastAPI app ──────────────────────────────────────────────────────────────
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="Mini RAG")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ─── /ingest ─────────────────────────────────────────────────────────────────
 @app.post("/ingest")
@@ -272,6 +291,23 @@ def health():
         "indexed_sources":  list(vector_store.ingested_sources),
     }
 
+# ─── API Endpoints for Eval Dashboard ────────────────────────────────────────
+
+from db.models import QueryMetric, EvalRun
+from fastapi import Depends
+
+@app.get("/api/eval/metrics")
+def get_metrics(limit: int = 50, db: Session = Depends(get_db)):
+    """Fetch recent query metrics with RAGAS scores."""
+    metrics = db.query(QueryMetric).order_by(QueryMetric.timestamp.desc()).limit(limit).all()
+    return metrics
+
+@app.get("/api/eval/runs")
+def get_eval_runs(limit: int = 10, db: Session = Depends(get_db)):
+    """Fetch benchmark runs."""
+    runs = db.query(EvalRun).order_by(EvalRun.timestamp.desc()).limit(limit).all()
+    return runs
+
 
 # ─── GRADIO UI ───────────────────────────────────────────────────────────────
 import gradio as gr
@@ -363,10 +399,23 @@ def ingest_file(files) -> str:
 # ─── Background RAGAS evaluator pool ─────────────────────────────────────────
 _ragas_pool = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ragas")
 
-def _run_ragas_background(question: str, answer: str, contexts: list[str]):
+def _run_ragas_background(metric_id: str, question: str, answer: str, contexts: list[str]):
     """Fire-and-forget RAGAS. Matches mini_rag.py's _run_ragas_background()."""
     try:
         res = evaluator.evaluate_single(question=question, answer=answer, contexts=contexts)
+        
+        # Save results to DB
+        from db.database import SessionLocal
+        from db.models import QueryMetric
+        with SessionLocal() as db:
+            metric = db.query(QueryMetric).filter(QueryMetric.id == metric_id).first()
+            if metric:
+                if res.faithfulness is not None:
+                    metric.faithfulness = res.faithfulness
+                if res.answer_relevancy is not None:
+                    metric.answer_relevancy = res.answer_relevancy
+                db.commit()
+                
         if res.faithfulness is not None:
             parts = []
             if res.faithfulness     is not None: parts.append(f"Faithfulness: {res.faithfulness:.2f}")
@@ -459,10 +508,37 @@ def chat_fn(message: str, history: list, session_id: str):
 
         yield answer + footer
 
-        # ── Background RAGAS ─────────────────────────────────────────────────
+        # ── Save to DB ───────────────────────────────────────────────────────
+        from db.database import SessionLocal
+        from db.models import QueryMetric
+        import uuid
+        
+        metric_id = str(uuid.uuid4())
         contexts = [s["content"] for s in sources]
+        
+        try:
+            with SessionLocal() as db:
+                metric = QueryMetric(
+                    id=metric_id,
+                    session_id=session_id,
+                    query=message,
+                    rewritten_query=rewritten_q,
+                    answer=answer,
+                    rewrite_time=rewrite_ms,
+                    retrieve_time=ret_ms,
+                    ttft=ttft_ms,
+                    generation_time=round(stream_total_ms - ttft_ms, 3) if stream_total_ms and ttft_ms else None,
+                    total_time=gen_ms,
+                    contexts=contexts
+                )
+                db.add(metric)
+                db.commit()
+        except Exception as db_e:
+            print(f"DB Error: {db_e}")
+
+        # ── Background RAGAS ─────────────────────────────────────────────────
         if contexts and "blocked by" not in answer.lower():
-            _ragas_pool.submit(_run_ragas_background, message, answer, contexts)
+            _ragas_pool.submit(_run_ragas_background, metric_id, message, answer, contexts)
 
     except Exception as e:
         yield f"❌ Error: {str(e)}"

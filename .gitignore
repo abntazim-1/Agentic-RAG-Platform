@@ -9,3 +9,4 @@ qdrant_db/
 *.log
 .DS_Store
 cv_bullets.md 
+*.db
