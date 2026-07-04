@@ -29,11 +29,15 @@ INJECTION_PATTERNS = [
     r"system prompt",
     r"jailbreak",
     r"DAN mode",
+    r"(exact rules|instructions|given before)",  # Base prompt evasion
+    r"User:.*AI:",                               # Few-shot injection attempt
 ]
 
 OUT_OF_SCOPE_PATTERNS = [
-    r"\b(bomb|weapon|explosive|poison|drug synthesis)\b",
+    r"\b(bomb|weapon|explosive|poison|drug synthesis|methamphetamine|synthesize)\b",
     r"\b(hack|exploit|vulnerability|malware|ransomware)\b",
+    r"\b(medical|medication|chest|pain|illness|disease|treatment)\b",  # Medical advice
+    r"(highly biased|biased opinion|controversial)",                  # Biased opinion fishing
 ]
 
 

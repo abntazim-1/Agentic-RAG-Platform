@@ -60,6 +60,7 @@ class RAGState(TypedDict):
     guard_reason: str
     conversation_history: str
     timings: dict
+    blocked: bool
 
 
 # ─── Context builders — exact port from mini_rag.py ─────────────────────────
@@ -134,6 +135,17 @@ def build_simple_graph(
         On first-turn queries (no history) skips LLM call entirely.
         """
         t0      = time.time()
+        
+        # [NEW] Enterprise Guardrails check
+        guard = InputGuard()
+        g_res = guard.check(s["query"])
+        if not g_res.passed:
+            s["answer"] = f"I can't help with that. {g_res.reason}"
+            s["sources"] = []
+            s["blocked"] = True
+            s.setdefault("timings", {})["guardrail"] = round(time.time() - t0, 3)
+            return s
+            
         history = memory.get_history(s["session_id"])
         query   = s["query"]
 
@@ -154,6 +166,9 @@ def build_simple_graph(
         return s
 
     def node_retrieve(s: RAGState) -> RAGState:
+        if s.get("blocked"):
+            return s
+            
         t0 = time.time()
         q  = s.get("rewritten_query") or s["query"]
         # Convert immutable cached tuple back to list (BUG 2 fix from mini_rag.py)
@@ -163,6 +178,9 @@ def build_simple_graph(
         return s
 
     def node_generate(s: RAGState) -> RAGState:
+        if s.get("blocked"):
+            return s
+            
         t0          = time.time()
         original_q  = s["query"]
         rewritten_q = s.get("rewritten_query") or original_q
@@ -212,6 +230,7 @@ def build_simple_graph(
             "guard_passed": True, "guard_reason": "",
             "conversation_history": "",
             "timings": {},
+            "blocked": False,
         })
         timings = result.get("timings", {})
         timings["total"] = round(time.time() - t0, 2)
