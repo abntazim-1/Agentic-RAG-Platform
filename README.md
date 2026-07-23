@@ -255,19 +255,7 @@ Production-Grade-Advanced-Rag/
 
 ---
 
-## 📈 Performance & Latency Benchmarks
-
-| Operation Stage | Latency | Optimization Detail |
-|---|---|---|
-| **Retrieval Cache Hit** | `~0 ms` | `@lru_cache(maxsize=1024)` hit |
-| **Hybrid Search (Cold)** | `~350–500 ms` | Parallel `ThreadPoolExecutor` (dense + sparse) |
-| **TinyBERT Reranking** | `~40–80 ms` | 4× faster than MiniLM-L-6 |
-| **Time-To-First-Token (TTFT)** | `~0.4–0.9 s` | Groq Llama 3.3 70B inference |
-| **Embedding Generation** | `~40–100 ms` | XPU / CUDA GPU hardware acceleration |
-| **Memory Consolidation** | `~15–30 ms` | Async turn consolidation & trace logging |
-
----
-
 ## 📄 License
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
