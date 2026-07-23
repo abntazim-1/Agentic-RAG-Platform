@@ -61,10 +61,16 @@ from retrieval.hybrid_retriever import HybridRetriever
 from retrieval.query_rewriter import QueryRewriter
 from reranking.reranker import Reranker, ContextCompressor
 from memory.conversation import ConversationMemory
+from memory.three_tier_memory import ThreeTierMemoryEngine
+from gateway.llm_gateway import ResilientLLMGateway
+from agent.orchestrator import ProductionAgenticOrchestrator
 from evaluation.evaluator import EmbeddingEvaluator
 from agent.graph import build_simple_graph
 from db.database import init_db, get_db
+from api.db_router import router as db_router
 from sqlalchemy.orm import Session
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 # Initialize Database
 init_db()
@@ -79,7 +85,10 @@ query_rewriter = QueryRewriter()
 retriever      = HybridRetriever(vector_store, bm25_store, embedder, query_rewriter)
 reranker       = Reranker()
 compressor     = ContextCompressor()
-memory         = ConversationMemory()
+legacy_memory  = ConversationMemory()
+three_tier_memory = ThreeTierMemoryEngine()
+llm_gateway    = ResilientLLMGateway()
+orchestrator   = ProductionAgenticOrchestrator(retriever, reranker, compressor, three_tier_memory, llm_gateway)
 evaluator      = EmbeddingEvaluator(embedder=embedder)
 
 # Rebuild BM25 from chunks restored by VectorStore on startup
@@ -87,7 +96,7 @@ bm25_store.build(vector_store.all_chunks)
 
 # Build LangGraph + helpers
 rag_graph, run, generate, generate_stream, cached_retrieve_and_rerank = (
-    build_simple_graph(retriever, reranker, memory)
+    build_simple_graph(retriever, reranker, legacy_memory)
 )
 
 # ─── Request models ───────────────────────────────────────────────────────────
@@ -107,7 +116,7 @@ class EvalReq(BaseModel):
 # ─── FastAPI app ──────────────────────────────────────────────────────────────
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Mini RAG")
+app = FastAPI(title="Production Agentic RAG Platform")
 
 app.add_middleware(
     CORSMiddleware,
@@ -116,6 +125,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include Real-Time Database Inspector Router
+app.include_router(db_router)
+
+# Serve Dashboard UI Static Route & File Response
+dashboard_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dashboard")
+dashboard_file = os.path.join(dashboard_dir, "index.html")
+
+@app.get("/dashboard")
+@app.get("/dashboard/")
+def serve_dashboard():
+    if os.path.exists(dashboard_file):
+        return FileResponse(dashboard_file)
+    raise HTTPException(status_code=404, detail="Dashboard index.html file not found")
+
+if os.path.exists(dashboard_dir):
+    app.mount("/static_dashboard", StaticFiles(directory=dashboard_dir, html=True), name="static_dashboard")
+
+
 
 # ─── /ingest ─────────────────────────────────────────────────────────────────
 @app.post("/ingest")
@@ -157,11 +185,13 @@ def ingest(req: IngestReq):
 # ─── /query ──────────────────────────────────────────────────────────────────
 @app.post("/query")
 def query_endpoint(req: QueryReq):
-    """Standard blocking query — returns full JSON response with timings."""
+    """Standard blocking query — returns full JSON response with timings, 3-tier memory save & telemetry."""
     try:
-        return run(req.query, req.session_id)
+        res = orchestrator.run(req.query, session_id=req.session_id)
+        return res.to_dict()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # ─── /query/stream ───────────────────────────────────────────────────────────
@@ -287,9 +317,10 @@ def health():
         "status":           "ok",
         "chunks_in_memory": vector_store.total_chunks,
         "vectors_in_qdrant": info.points_count,
-        "active_sessions":  memory.active_sessions,
+        "active_sessions":  legacy_memory.active_sessions,
         "indexed_sources":  list(vector_store.ingested_sources),
     }
+
 
 # ─── API Endpoints for Eval Dashboard ────────────────────────────────────────
 
@@ -396,6 +427,48 @@ def ingest_file(files) -> str:
     return "\n".join(results)
 
 
+def get_indexed_sources_markdown() -> str:
+    """Returns formatted markdown table listing all currently uploaded and indexed files."""
+    sources = list(vector_store.ingested_sources)
+    if not sources:
+        return "ℹ️ *No files have been uploaded or indexed yet.*"
+    
+    md_lines = [
+        "| # | Filename / Source Name | Vector Chunks | Status |",
+        "|---|---|---|---|"
+    ]
+    for idx, src in enumerate(sorted(sources)):
+        chunk_count = sum(1 for c in vector_store.all_chunks if c.source == src)
+        md_lines.append(f"| {idx+1} | `{src}` | **{chunk_count}** chunks | Indexed & Active |")
+    
+    return "\n".join(md_lines)
+
+
+def delete_indexed_source_fn(source_name: str) -> tuple[str, str]:
+    """Deletes an indexed source and updates the indexed files list."""
+    src = source_name.strip()
+    if not src:
+        return "⚠️ Please enter a valid source name to delete.", get_indexed_sources_markdown()
+    
+    if src not in vector_store.ingested_sources:
+        return f"❌ Source '{src}' not found in index.", get_indexed_sources_markdown()
+    
+    removed = vector_store.delete_source(src)
+    bm25_store.build(vector_store.all_chunks)
+    cached_retrieve_and_rerank.cache_clear()
+    
+    msg = f"✅ Deleted source '{src}' ({removed} chunks removed)."
+    return msg, get_indexed_sources_markdown()
+
+
+def ingest_file_and_refresh(files) -> tuple[str, str]:
+    """Ingests uploaded files and updates the indexed files list markdown."""
+    status = ingest_file(files)
+    updated_sources = get_indexed_sources_markdown()
+    return status, updated_sources
+
+
+
 # ─── Background RAGAS evaluator pool ─────────────────────────────────────────
 _ragas_pool = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ragas")
 
@@ -427,17 +500,17 @@ def _run_ragas_background(metric_id: str, question: str, answer: str, contexts: 
 
 def chat_fn(message: str, history: list, session_id: str):
     """
-    Streaming chat with background RAGAS evaluation.
-    Matches mini_rag.py's chat_fn() exactly:
-      - Per-session session_id from gr.State
-      - Parallel rewrite + prefetch when history exists
-      - Streaming tokens live
-      - Timings footer + rewritten query display + source citations
-      - Background RAGAS evaluation
+    Streaming chat with 3-tier memory, background RAGAS evaluation, and orchestrator.
     """
+    if callable(session_id):
+        session_id = session_id()
+    if not isinstance(session_id, str):
+        session_id = str(session_id)
+
     try:
         t0          = time.time()
-        history_str = memory.get_history(session_id)
+        history_str = legacy_memory.get_history(session_id)
+
 
         if not history_str.strip():
             rewritten_q = message
@@ -485,8 +558,20 @@ def chat_fn(message: str, history: list, session_id: str):
             yield "The model returned an empty response. Please try again."
             return
 
-        memory.add(session_id, "user",      message)
-        memory.add(session_id, "assistant", answer)
+        legacy_memory.add(session_id, "user",      message)
+        legacy_memory.add(session_id, "assistant", answer)
+        three_tier_memory.consolidate_turn(
+            session_id=session_id,
+            trace_id=f"tr-gradio-{uuid.uuid4().hex[:6]}",
+            user_query=message,
+            assistant_response=answer,
+            plan_steps=["gradio_chat", "hybrid_retrieval", "llm_gen"],
+            tool_calls=[],
+            latency_ms=int(gen_ms * 1000),
+            prompt_tokens=150,
+            completion_tokens=len(answer)//4,
+            cost_usd=0.0002
+        )
 
         # ── Footer: timings + rewritten query + sources ──────────────────────
         footer = ""
@@ -508,10 +593,10 @@ def chat_fn(message: str, history: list, session_id: str):
 
         yield answer + footer
 
+
         # ── Save to DB ───────────────────────────────────────────────────────
         from db.database import SessionLocal
         from db.models import QueryMetric
-        import uuid
         
         metric_id = str(uuid.uuid4())
         contexts = [s["content"] for s in sources]
@@ -545,28 +630,31 @@ def chat_fn(message: str, history: list, session_id: str):
 
 
 # ─── Gradio UI blocks — matches mini_rag.py's gr.Blocks() exactly ────────────
-with gr.Blocks() as demo:
-    gr.Markdown("# Mini RAG System")
+with gr.Blocks(title="Production Agentic RAG System") as demo:
+    gr.Markdown("# Production-Grade Agentic RAG System")
     gr.Markdown(
-        "Production RAG: LangGraph + BM25 + Qdrant Hybrid Search + "
-        "Cross-Encoder Reranking (TinyBERT) + Groq Inference."
+        "**Architecture:** Hybrid Search (Dense Qdrant + Sparse BM25) | Cross-Encoder Reranking (TinyBERT) | "
+        "3-Tier Memory Store (Working, Semantic, Episodic, Procedural) | Resilient LLM Gateway | OTel Latency Telemetry"
     )
-    # Each browser tab gets its own session ID (BUG 4 fix from mini_rag.py)
-    session_state = gr.State(lambda: f"gradio_{uuid.uuid4().hex[:8]}")
+    def get_new_session_id():
+        return f"gradio_{uuid.uuid4().hex[:8]}"
+
+    session_state = gr.State(get_new_session_id)
+
 
     with gr.Tabs():
-        with gr.TabItem("Chat"):
+        with gr.TabItem("💬 Chat"):
             gr.ChatInterface(
                 fn=chat_fn,
                 additional_inputs=[session_state],
-                chatbot=gr.Chatbot(height=500),
+                chatbot=gr.Chatbot(height=520),
                 textbox=gr.Textbox(
-                    placeholder="Ask a question about the indexed documents...",
+                    placeholder="Ask a question about the indexed documents or Tazim's CV...",
                     container=False,
                     scale=7,
                 ),
             )
-        with gr.TabItem("Add Knowledge"):
+        with gr.TabItem("📁 Add Knowledge"):
             gr.Markdown(
                 "### Drop your files below to index them\n"
                 "Supported formats: **PDF, DOCX, TXT, MD, CSV, JSON** "
@@ -579,11 +667,33 @@ with gr.Blocks() as demo:
                 type="filepath",
             )
             ingest_btn    = gr.Button("Ingest Files", variant="primary")
-            ingest_status = gr.Textbox(label="Ingestion Status", interactive=False, lines=6)
-            ingest_btn.click(fn=ingest_file, inputs=[file_drop], outputs=ingest_status)
+            ingest_status = gr.Textbox(label="Ingestion Status", interactive=False, lines=4)
+
+            gr.Markdown("---")
+            gr.Markdown("### 📚 Previously Uploaded & Indexed Files")
+            indexed_files_display = gr.Markdown(value=get_indexed_sources_markdown())
+            refresh_files_btn = gr.Button("🔄 Refresh Indexed Files List", variant="secondary")
+
+
+            with gr.Row():
+                delete_input = gr.Textbox(label="Delete File / Source Name", placeholder="Enter exact source filename (e.g., Tazim_CV.pdf)...", scale=4)
+                delete_btn = gr.Button("🗑️ Delete Source", variant="stop", scale=1)
+                delete_status = gr.Textbox(label="Delete Status", interactive=False, scale=2)
+
+            ingest_btn.click(fn=ingest_file_and_refresh, inputs=[file_drop], outputs=[ingest_status, indexed_files_display])
+            refresh_files_btn.click(fn=get_indexed_sources_markdown, inputs=[], outputs=[indexed_files_display])
+            delete_btn.click(fn=delete_indexed_source_fn, inputs=[delete_input], outputs=[delete_status, indexed_files_display])
+
+
+        with gr.TabItem("⚡ System Dashboard & Architecture"):
+            gr.Markdown("### Real-Time System Architecture, OTel Latency Waterfall & Database Inspector")
+            gr.HTML(
+                '<iframe src="/dashboard" style="width:100%; height:820px; border:1px solid rgba(255,255,255,0.1); border-radius:14px;"></iframe>'
+            )
 
 # Mount Gradio onto the FastAPI app (matches mini_rag.py)
 app = gr.mount_gradio_app(app, demo, path="/")
+
 
 if __name__ == "__main__":
     import uvicorn

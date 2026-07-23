@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Production Agentic RAG — Live Architecture & Granular Latency Inspector</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #090d16;
+            --bg-card: rgba(17, 24, 39, 0.85);
+            --bg-card-border: rgba(255, 255, 255, 0.08);
+            --accent-cyan: #00f2fe;
+            --accent-blue: #4facfe;
+            --accent-purple: #7f00ff;
+            --accent-emerald: #10b981;
+            --accent-amber: #f59e0b;
+            --accent-rose: #ef4444;
+            --accent-indigo: #6366f1;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --font-main: 'Inter', sans-serif;
+            --font-title: 'Outfit', sans-serif;
+            --font-code: 'Fira Code', monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            font-family: var(--font-main);
+            min-height: 100vh;
+            overflow-x: hidden;
+            display: flex;
+            flex-direction: column;
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(79, 172, 254, 0.08) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(127, 0, 255, 0.08) 0%, transparent 40%);
+        }
+
+        /* App Layout */
+        .header {
+            background: rgba(11, 15, 25, 0.95);
+            border-bottom: 1px solid var(--bg-card-border);
+            padding: 1rem 1.5rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            backdrop-filter: blur(12px);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .brand-logo {
+            width: 38px;
+            height: 38px;
+            border-radius: 10px;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-family: var(--font-title);
+            font-size: 1.2rem;
+            color: #fff;
+            box-shadow: 0 0 20px rgba(0, 242, 254, 0.4);
+        }
+
+        .brand-title {
+            font-family: var(--font-title);
+            font-size: 1.25rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            background: linear-gradient(90deg, #fff, #9ca3af);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .brand-subtitle {
+            font-size: 0.75rem;
+            color: var(--accent-cyan);
+            font-family: var(--font-code);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        /* Control Panel */
+        .controls-bar {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            background: rgba(255, 255, 255, 0.03);
+            padding: 0.5rem 1rem;
+            border-radius: 12px;
+            border: 1px solid var(--bg-card-border);
+        }
+
+        .btn {
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            color: var(--text-main);
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            transition: all 0.2s ease;
+        }
+
+        .btn:hover {
+            background: rgba(255, 255, 255, 0.15);
+            transform: translateY(-1px);
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #2563eb, #7c3aed);
+            border: none;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.4);
+        }
+
+        .preset-select {
+            background: rgba(15, 23, 42, 0.9);
+            color: var(--text-main);
+            border: 1px solid var(--bg-card-border);
+            padding: 0.5rem 0.75rem;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            outline: none;
+            cursor: pointer;
+        }
+
+        /* Main View Container */
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 1fr 420px;
+            gap: 1rem;
+            padding: 1rem;
+            flex: 1;
+        }
+
+        .architecture-viewport {
+            background: var(--bg-card);
+            border: 1px solid var(--bg-card-border);
+            border-radius: 16px;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            backdrop-filter: blur(12px);
+            min-height: 640px;
+        }
+
+        .viewport-header {
+            padding: 0.75rem 1.25rem;
+            border-bottom: 1px solid var(--bg-card-border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(0, 0, 0, 0.2);
+        }
+
+        .view-switcher { display: flex; gap: 0.5rem; }
+
+        .view-btn {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: var(--text-muted);
+            padding: 0.35rem 0.75rem;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            cursor: pointer;
+        }
+
+        .view-btn.active {
+            background: var(--accent-indigo);
+            color: #fff;
+            font-weight: 600;
+        }
+
+        .svg-canvas-container { position: relative; flex: 1; width: 100%; height: 100%; }
+
+        .node-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            padding: 1.5rem;
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            grid-template-rows: repeat(3, 1fr);
+            gap: 1.5rem;
+        }
+
+        .node {
+            background: rgba(15, 23, 42, 0.75);
+            border: 1px solid var(--bg-card-border);
+            border-radius: 14px;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            cursor: pointer;
+            backdrop-filter: blur(8px);
+        }
+
+        .node.state-processing {
+            border-color: var(--accent-cyan);
+            box-shadow: 0 0 25px rgba(0, 242, 254, 0.35);
+        }
+
+        .node.state-success {
+            border-color: var(--accent-emerald);
+            box-shadow: 0 0 20px rgba(16, 185, 129, 0.3);
+        }
+
+        .node.state-failure {
+            border-color: var(--accent-rose);
+            box-shadow: 0 0 25px rgba(239, 68, 68, 0.4);
+        }
+
+        .node-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem; }
+        .node-icon-title { display: flex; align-items: center; gap: 0.5rem; }
+        .node-icon {
+            width: 28px;
+            height: 28px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.05);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.9rem;
+        }
+        .node-name { font-size: 0.85rem; font-weight: 600; color: #fff; }
+        .node-badge {
+            font-size: 0.65rem;
+            font-family: var(--font-code);
+            padding: 0.15rem 0.4rem;
+            border-radius: 4px;
+            text-transform: uppercase;
+            font-weight: 600;
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--text-muted);
+        }
+        .node-metrics {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            font-family: var(--font-code);
+            margin-top: 0.5rem;
+            padding-top: 0.4rem;
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        /* Granular Latency Waterfall Component */
+        .latency-waterfall-card {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            margin-top: 0.5rem;
+        }
+
+        .span-row {
+            display: flex;
+            flex-direction: column;
+            gap: 0.2rem;
+            font-size: 0.72rem;
+            font-family: var(--font-code);
+        }
+
+        .span-meta {
+            display: flex;
+            justify-content: space-between;
+            color: #d1d5db;
+        }
+
+        .span-bar-bg {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 4px;
+            height: 8px;
+            width: 100%;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .span-bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            background: linear-gradient(90deg, var(--accent-cyan), var(--accent-purple));
+            transition: width 0.4s ease;
+        }
+
+        /* Database Explorer Section */
+        .db-inspector-container {
+            display: none;
+            flex-direction: column;
+            height: 100%;
+            padding: 1rem;
+            gap: 1rem;
+            background: #070a12;
+        }
+
+        .db-table-bar { display: flex; gap: 0.5rem; align-items: center; }
+        .db-select {
+            background: rgba(15, 23, 42, 0.9);
+            color: #fff;
+            border: 1px solid var(--bg-card-border);
+            padding: 0.4rem 0.8rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            outline: none;
+            cursor: pointer;
+        }
+
+        select option {
+            background-color: #0b0f19 !important;
+            color: #f3f4f6 !important;
+            padding: 8px 12px !important;
+        }
+
+        select option:hover,
+        select option:focus,
+        select option:checked {
+            background-color: #1e293b !important;
+            color: var(--accent-cyan) !important;
+        }
+
+        .db-table-wrapper {
+            flex: 1;
+            overflow: auto;
+            border: 1px solid var(--bg-card-border);
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.4);
+        }
+        table.db-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: var(--font-code);
+            font-size: 0.75rem;
+            color: #d1d5db;
+        }
+        table.db-table th {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 0.6rem;
+            text-align: left;
+            border-bottom: 1px solid var(--bg-card-border);
+            color: var(--accent-cyan);
+        }
+        table.db-table td {
+            padding: 0.6rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            vertical-align: top;
+            word-break: break-all;
+        }
+
+        /* Sidebar Layout */
+        .sidebar { display: flex; flex-direction: column; gap: 1rem; }
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--bg-card-border);
+            border-radius: 16px;
+            padding: 1.25rem;
+            backdrop-filter: blur(12px);
+        }
+        .card-title {
+            font-size: 0.9rem;
+            font-weight: 700;
+            color: #fff;
+            margin-bottom: 0.75rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .telemetry-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 0.75rem;
+        }
+        .stat-box {
+            background: rgba(0, 0, 0, 0.25);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+            padding: 0.75rem;
+        }
+        .stat-label { font-size: 0.7rem; color: var(--text-muted); margin-bottom: 0.25rem; }
+        .stat-value { font-size: 1.1rem; font-weight: 700; font-family: var(--font-code); color: var(--accent-cyan); }
+
+        .terminal {
+            background: #05070d;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 0.75rem;
+            font-family: var(--font-code);
+            font-size: 0.72rem;
+            height: 200px;
+            overflow-y: auto;
+            color: #d1d5db;
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+        }
+        .log-entry { line-height: 1.4; word-break: break-word; }
+        .log-time { color: #6b7280; }
+        .log-info { color: #60a5fa; }
+        .log-success { color: #34d399; }
+        .log-warn { color: #fbbf24; }
+        .log-error { color: #f87171; }
+        .log-trace { color: #c084fc; }
+    </style>
+</head>
+<body>
+
+    <!-- Header Navigation -->
+    <header class="header">
+        <div class="brand">
+            <div class="brand-logo">A</div>
+            <div>
+                <div class="brand-title">Production Agentic RAG System</div>
+                <div class="brand-subtitle">Real-Time Execution Topology & Granular Latency Telemetry</div>
+            </div>
+        </div>
+
+        <div class="controls-bar">
+            <select id="scenarioSelect" class="preset-select" onchange="loadScenario(this.value)">
+                <option value="standard">Scenario 1: Standard Hybrid RAG Query (Success Flow)</option>
+                <option value="multihop">Scenario 2: Multi-Hop Agentic Reasoning with Web Search</option>
+                <option value="fallback">Scenario 3: Groq API Rate-Limit → Fallback Router</option>
+                <option value="security_block">Scenario 4: Prompt Injection Guardrail Rejection</option>
+            </select>
+
+            <button class="btn btn-primary" onclick="togglePlay()">
+                <span id="playIcon">▶</span> <span id="playText">Play Trace</span>
+            </button>
+            <button class="btn" onclick="stepNext()">Step ➔</button>
+            <button class="btn" onclick="resetSimulation()">↺ Reset</button>
+        </div>
+    </header>
+
+    <!-- Main Dashboard Grid -->
+    <main class="dashboard-grid">
+        
+        <!-- Left Column: Component Map OR DB Inspector -->
+        <section class="architecture-viewport">
+            <div class="viewport-header">
+                <div class="view-switcher">
+                    <button id="btnViewArch" class="view-btn active" onclick="switchMainView('arch')">⚡ Component Topology</button>
+                    <button id="btnViewDb" class="view-btn" onclick="switchMainView('db')">🗄️ Real-Time DB Inspector</button>
+                </div>
+                <span id="dbBadge" class="node-badge" style="background: rgba(16, 185, 129, 0.15); color: var(--accent-emerald);">DB ENGINE: SQLite / Postgres</span>
+            </div>
+
+            <!-- Architecture Topology View -->
+            <div id="archView" class="svg-canvas-container">
+                <div class="node-container">
+                    <div id="node-gateway" class="node state-waiting" onclick="inspectNode('gateway')">
+                        <div class="node-header">
+                            <div class="node-icon-title"><div class="node-icon">🌐</div><div class="node-name">API Gateway</div></div>
+                            <div class="node-badge">FastAPI</div>
+                        </div>
+                        <div class="node-metrics"><span>AUTH: JWT OK</span><span id="m-gateway">0ms</span></div>
+                    </div>
+
+                    <div id="node-guardrails" class="node state-waiting" onclick="inspectNode('guardrails')">
+                        <div class="node-header">
+                            <div class="node-icon-title"><div class="node-icon">🛡️</div><div class="node-name">Security Guards</div></div>
+                            <div class="node-badge">NeMo / Regex</div>
+                        </div>
+                        <div class="node-metrics"><span>SAFETY: PASS</span><span id="m-guardrails">--</span></div>
+                    </div>
+
+                    <div id="node-orchestrator" class="node state-waiting" onclick="inspectNode('orchestrator')">
+                        <div class="node-header">
+                            <div class="node-icon-title"><div class="node-icon">🧠</div><div class="node-name">Agent Orchestrator</div></div>
+                            <div class="node-badge">LangGraph</div>
+                        </div>
+                        <div class="node-metrics"><span>LOOP: REACT</span><span id="m-orchestrator">--</span></div>
+                    </div>
+
+                    <div id="node-memory" class="node state-waiting" onclick="inspectNode('memory')">
+                        <div class="node-header">
+                            <div class="node-icon-title"><div class="node-icon">💾</div><div class="node-name">3-Tier Memory Store</div></div>
+                            <div class="node-badge">DB + Qdrant</div>
+                        </div>
+                        <div class="node-metrics"><span>R/W: ACTIVE</span><span id="m-memory">--</span></div>
+                    </div>
+
+                    <!-- Row 2 -->
+                    <div id="node-dense" class="node state-waiting" onclick="inspectNode('dense')">
+                        <div class="node-header">
+                            <div class="node-icon-title"><div class="node-icon">🔍</div><div class="node-name">Dense Vector Search</div></div>
+                            <div class="node-badge">BGE-M3 (Qdrant)</div>
+                        </div>
+                        <div class="node-metrics"><span>TOP-K: 15</span><span id="m-dense">--</span></div>
+                    </div>
+
+                    <div id="node-sparse" class="node state-waiting" onclick="inspectNode('sparse')">
+                        <div class="node-header">
+                            <div class="node-icon-title"><div class="node-icon">📄</div><div class="node-name">Sparse BM25 Engine</div></div>
+                            <div class="node-badge">Keyword Index</div>
+                        </div>
+                        <div class="node-metrics"><span>TOP-K: 15</span><span id="m-sparse">--</span></div>
+                    </div>
+
+                    <div id="node-reranker" class="node state-waiting" onclick="inspectNode('reranker')">
+                        <div class="node-header">
+                            <div class="node-icon-title"><div class="node-icon">⚖️</div><div class="node-name">Cross-Encoder Reranker</div></div>
+                            <div class="node-badge">TinyBERT</div>
+                        </div>
+                        <div class="node-metrics"><span>TOP-K: 5</span><span id="m-reranker">--</span></div>
+                    </div>
+
+                    <div id="node-selfrag" class="node state-waiting" onclick="inspectNode('selfrag')">
+                        <div class="node-header">
+                            <div class="node-icon-title"><div class="node-icon">🔬</div><div class="node-name">Self-RAG Evaluator</div></div>
+                            <div class="node-badge">Faithfulness</div>
+                        </div>
+                        <div class="node-metrics"><span>SCORE: 0.94</span><span id="m-selfrag">--</span></div>
+                    </div>
+
+                    <!-- Row 3 -->
+                    <div id="node-tools" class="node state-waiting" onclick="inspectNode('tools')">
+                        <div class="node-header">
+                            <div class="node-icon-title"><div class="node-icon">🛠️</div><div class="node-name">Tool Ecosystem</div></div>
+                            <div class="node-badge">Tavily / E2B</div>
+                        </div>
+                        <div class="node-metrics"><span>INVOKED: 0</span><span id="m-tools">--</span></div>
+                    </div>
+
+                    <div id="node-llm" class="node state-waiting" onclick="inspectNode('llm')">
+                        <div class="node-header">
+                            <div class="node-icon-title"><div class="node-icon">🤖</div><div class="node-name">Resilient LLM Gateway</div></div>
+                            <div class="node-badge">Groq / OpenAI</div>
+                        </div>
+                        <div class="node-metrics"><span>MODEL: Llama 3.3</span><span id="m-llm">--</span></div>
+                    </div>
+
+                    <div id="node-telemetry" class="node state-waiting" onclick="inspectNode('telemetry')">
+                        <div class="node-header">
+                            <div class="node-icon-title"><div class="node-icon">📊</div><div class="node-name">Observability Suite</div></div>
+                            <div class="node-badge">OTel / Jaeger</div>
+                        </div>
+                        <div class="node-metrics"><span>SPANS: 12</span><span id="m-telemetry">--</span></div>
+                    </div>
+
+                    <div id="node-consolidation" class="node state-waiting" onclick="inspectNode('consolidation')">
+                        <div class="node-header">
+                            <div class="node-icon-title"><div class="node-icon">🔄</div><div class="node-name">Memory Consolidator</div></div>
+                            <div class="node-badge">Async Worker</div>
+                        </div>
+                        <div class="node-metrics"><span>EVAPORATE: 0%</span><span id="m-consolidation">--</span></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Real-Time Database Inspector View -->
+            <div id="dbView" class="db-inspector-container">
+                <div class="db-table-bar">
+                    <span style="font-size: 0.85rem; color: var(--text-muted);">Select Table:</span>
+                    <select id="tableSelect" class="db-select" onchange="renderTableData(this.value)">
+                        <option value="procedural_strategies">procedural_strategies (Procedural Memory)</option>
+                        <option value="episodic_traces">episodic_traces (Episodic Memory)</option>
+                        <option value="semantic_facts">semantic_facts (Semantic Memory)</option>
+                        <option value="working_sessions">working_sessions (Working Memory)</option>
+                        <option value="document_chunks">document_chunks (Vector Chunks)</option>
+                    </select>
+                    <button class="btn" style="padding: 0.3rem 0.6rem; font-size: 0.75rem;" onclick="refreshDbView()">🔄 Refresh DB Rows</button>
+                </div>
+
+                <div class="db-table-wrapper">
+                    <table class="db-table" id="dbTable">
+                        <!-- Rendered by JS -->
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- Right Side: Latency Breakdown & Telemetry -->
+        <aside class="sidebar">
+
+            <!-- Telemetry Stats Grid (with TTFT) -->
+            <div class="card">
+                <div class="card-title">
+                    <span>⏱️ Telemetry & Latency Metrics</span>
+                    <span id="statusIndicator" class="node-badge" style="background: rgba(16, 185, 129, 0.2); color: var(--accent-emerald);">IDLE</span>
+                </div>
+                <div class="telemetry-grid">
+                    <div class="stat-box">
+                        <div class="stat-label">Total Latency</div>
+                        <div id="statLatency" class="stat-value">0 ms</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-label">Time to 1st Token (TTFT)</div>
+                        <div id="statTtft" class="stat-value" style="color: var(--accent-amber);">0 ms</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-label">Prompt Tokens</div>
+                        <div id="statPromptTokens" class="stat-value">0</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-label">Est. Cost (USD)</div>
+                        <div id="statCost" class="stat-value">$0.0000</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- OTel Granular Latency Waterfall Spans -->
+            <div class="card">
+                <div class="card-title">📊 Granular Process Latency Breakdown (OTel Spans)</div>
+                <div class="latency-waterfall-card">
+                    
+                    <div class="span-row">
+                        <div class="span-meta"><span>1. Security Guardrails</span><span id="span-guardrails-val">0ms</span></div>
+                        <div class="span-bar-bg"><div id="span-guardrails-bar" class="span-bar-fill" style="width: 0%;"></div></div>
+                    </div>
+
+                    <div class="span-row">
+                        <div class="span-meta"><span>2. 3-Tier Memory Fetch</span><span id="span-memory-val">0ms</span></div>
+                        <div class="span-bar-bg"><div id="span-memory-bar" class="span-bar-fill" style="width: 0%;"></div></div>
+                    </div>
+
+                    <div class="span-row">
+                        <div class="span-meta"><span>3. Query Rewriting</span><span id="span-rewrite-val">0ms</span></div>
+                        <div class="span-bar-bg"><div id="span-rewrite-bar" class="span-bar-fill" style="width: 0%;"></div></div>
+                    </div>
+
+                    <div class="span-row">
+                        <div class="span-meta"><span>4. Dense Vector Search (Qdrant)</span><span id="span-dense-val">0ms</span></div>
+                        <div class="span-bar-bg"><div id="span-dense-bar" class="span-bar-fill" style="width: 0%;"></div></div>
+                    </div>
+
+                    <div class="span-row">
+                        <div class="span-meta"><span>5. Sparse BM25 Search</span><span id="span-sparse-val">0ms</span></div>
+                        <div class="span-bar-bg"><div id="span-sparse-bar" class="span-bar-fill" style="width: 0%;"></div></div>
+                    </div>
+
+                    <div class="span-row">
+                        <div class="span-meta"><span>6. Cross-Encoder Reranker</span><span id="span-reranker-val">0ms</span></div>
+                        <div class="span-bar-bg"><div id="span-reranker-bar" class="span-bar-fill" style="width: 0%;"></div></div>
+                    </div>
+
+                    <div class="span-row">
+                        <div class="span-meta"><span>7. LLM Time-To-First-Token (TTFT)</span><span id="span-ttft-val">0ms</span></div>
+                        <div class="span-bar-bg"><div id="span-ttft-bar" class="span-bar-fill" style="width: 0%; background: linear-gradient(90deg, #f59e0b, #ef4444);"></div></div>
+                    </div>
+
+                    <div class="span-row">
+                        <div class="span-meta"><span>8. Full Generation Stream</span><span id="span-llm-val">0ms</span></div>
+                        <div class="span-bar-bg"><div id="span-llm-bar" class="span-bar-fill" style="width: 0%;"></div></div>
+                    </div>
+
+                    <div class="span-row">
+                        <div class="span-meta"><span>9. Async Memory Consolidation</span><span id="span-consolidation-val">0ms</span></div>
+                        <div class="span-bar-bg"><div id="span-consolidation-bar" class="span-bar-fill" style="width: 0%;"></div></div>
+                    </div>
+
+                </div>
+            </div>
+
+            <!-- Distributed Log Feed -->
+            <div class="card" style="flex: 1;">
+                <div class="card-title">📋 Distributed Latency Trace Logs</div>
+                <div id="terminal" class="terminal">
+                    <div class="log-entry"><span class="log-time">[11:43:00]</span> <span class="log-info">[INFO]</span> Latency Monitor Initialized. Ready to measure spans.</div>
+                </div>
+            </div>
+
+        </aside>
+
+    </main>
+
+    <script>
+        // Mock Real-Time Database Tables
+        const DB_TABLE_DATA = {
+            procedural_strategies: {
+                columns: ["id", "query_category", "description", "workflow_dag", "success_rate", "avg_latency_ms"],
+                rows: [
+                    ["strat_01", "factual_lookup", "Direct hybrid dense+sparse RRF", '{"steps":["rewrite","retrieve","generate"]}', 0.98, 890],
+                    ["strat_02", "multi_hop_research", "Decompose into sub-goals + Tavily search", '{"steps":["plan","web_search","rerank","generate"]}', 0.94, 1420]
+                ]
+            },
+            episodic_traces: {
+                columns: ["id", "trace_id", "user_query", "latency_ms", "ttft_ms", "tokens", "cost_usd", "status"],
+                rows: [
+                    ["tr_101", "tr-9482-exec", "Explain hybrid RAG architecture", 897, 145, 430, "$0.0003", "success"],
+                    ["tr_102", "tr-9483-exec", "Search external vector DB benchmarks", 1420, 210, 680, "$0.0006", "recovered"]
+                ]
+            },
+            semantic_facts: {
+                columns: ["id", "user_id", "subject", "predicate", "object", "confidence"],
+                rows: [
+                    ["fact_1", "user_42", "User", "prefers", "Concise markdown answers", 0.99]
+                ]
+            },
+            working_sessions: {
+                columns: ["id", "user_id", "turns_count", "scratchpad_summary"],
+                rows: [
+                    ["sess_9482", "user_42", 4, "Active turn: Hybrid RAG latency telemetry"]
+                ]
+            },
+            document_chunks: {
+                columns: ["chunk_id", "source", "heading", "content_preview"],
+                rows: [
+                    ["chk_001", "README.md", "Architecture", "A production-grade enterprise RAG system..."]
+                ]
+            }
+        };
+
+        const SCENARIOS = {
+            standard: [
+                { node: 'gateway', status: 'success', latency: 12, ttft: 0, log: 'API Gateway Auth & Rate Limit check: 12ms', spanId: 'guardrails', spanPct: 4 },
+                { node: 'guardrails', status: 'success', latency: 25, ttft: 0, log: 'Security Guardrails evaluation: 25ms', spanId: 'guardrails', spanPct: 6 },
+                { node: 'memory', status: 'processing', latency: 15, ttft: 0, log: '3-Tier Memory read: 15ms', spanId: 'memory', spanPct: 4 },
+                { node: 'orchestrator', status: 'processing', latency: 40, ttft: 0, log: 'Query Rewriter LLM call: 40ms', spanId: 'rewrite', spanPct: 10 },
+                { node: 'dense', status: 'success', latency: 145, ttft: 0, log: 'Qdrant Dense Vector Search: 145ms', spanId: 'dense', spanPct: 35 },
+                { node: 'sparse', status: 'success', latency: 110, ttft: 0, log: 'BM25 Sparse Keyword Search: 110ms', spanId: 'sparse', spanPct: 25 },
+                { node: 'reranker', status: 'success', latency: 85, ttft: 0, log: 'Cross-Encoder TinyBERT score reranking: 85ms', spanId: 'reranker', spanPct: 20 },
+                { node: 'selfrag', status: 'success', latency: 45, ttft: 0, log: 'Self-RAG Evaluator context check: 45ms', spanId: 'ttft', spanPct: 10 },
+                { node: 'llm', status: 'success', latency: 420, ttft: 145, log: 'LLM Time To First Token (TTFT): 145ms | Full Stream Generation: 420ms', spanId: 'llm', spanPct: 90 },
+                { node: 'consolidation', status: 'success', latency: 30, ttft: 0, log: 'Async SQLite Memory Consolidation: 30ms', spanId: 'consolidation', spanPct: 8 }
+            ]
+        };
+
+        let currentStepIndex = -1;
+        let isPlaying = false;
+        let totalLatency = 0;
+        let currentTtft = 0;
+
+        function switchMainView(view) {
+            document.getElementById('btnViewArch').classList.toggle('active', view === 'arch');
+            document.getElementById('btnViewDb').classList.toggle('active', view === 'db');
+            document.getElementById('archView').style.display = view === 'arch' ? 'flex' : 'none';
+            document.getElementById('dbView').style.display = view === 'db' ? 'flex' : 'none';
+
+            if (view === 'db') renderTableData(document.getElementById('tableSelect').value);
+        }
+
+        function renderTableData(tableName) {
+            const tableEl = document.getElementById('dbTable');
+            const data = DB_TABLE_DATA[tableName];
+            if (!data) return;
+
+            let html = '<thead><tr>' + data.columns.map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>';
+            data.rows.forEach(r => {
+                html += '<tr>' + r.map(cell => `<td>${typeof cell === 'object' ? JSON.stringify(cell) : cell}</td>`).join('') + '</tr>';
+            });
+            html += '</tbody>';
+            tableEl.innerHTML = html;
+        }
+
+        function refreshDbView() {
+            renderTableData(document.getElementById('tableSelect').value);
+            log('info', 'Refreshed Database Table rows from SQLite storage.');
+        }
+
+        function stepNext() {
+            const steps = SCENARIOS.standard;
+            if (currentStepIndex >= steps.length - 1) return;
+            currentStepIndex++;
+            const step = steps[currentStepIndex];
+
+            // Update Node UI
+            const nodeEl = document.getElementById(`node-${step.node}`);
+            if (nodeEl) {
+                nodeEl.className = `node state-${step.status}`;
+                const mEl = document.getElementById(`m-${step.node}`);
+                if (mEl) mEl.innerText = `${step.latency}ms`;
+            }
+
+            // Update Latency Waterfall Bars
+            if (step.spanId) {
+                const valEl = document.getElementById(`span-${step.spanId}-val`);
+                const barEl = document.getElementById(`span-${step.spanId}-bar`);
+                if (valEl) valEl.innerText = `${step.latency}ms`;
+                if (barEl) barEl.style.width = `${step.spanPct}%`;
+            }
+
+            // Update Telemetry Metrics
+            totalLatency += step.latency;
+            if (step.ttft > 0) currentTtft = step.ttft;
+
+            document.getElementById('statLatency').innerText = `${totalLatency} ms`;
+            document.getElementById('statTtft').innerText = `${currentTtft} ms`;
+            document.getElementById('statPromptTokens').innerText = Math.floor(totalLatency * 1.4);
+            document.getElementById('statCost').innerText = `$${(totalLatency * 0.0000005).toFixed(4)}`;
+
+            log('success', `[${step.node.toUpperCase()}] ${step.log}`);
+        }
+
+        function togglePlay() {
+            if (isPlaying) { isPlaying = false; }
+            else { isPlaying = true; stepNext(); }
+        }
+
+        function resetSimulation() {
+            currentStepIndex = -1;
+            totalLatency = 0;
+            currentTtft = 0;
+            document.querySelectorAll('.node').forEach(n => n.className = 'node state-waiting');
+            document.querySelectorAll('.span-bar-fill').forEach(b => b.style.width = '0%');
+            document.querySelectorAll('[id^=span-][id$=-val]').forEach(v => v.innerText = '0ms');
+            document.getElementById('statLatency').innerText = '0 ms';
+            document.getElementById('statTtft').innerText = '0 ms';
+            document.getElementById('terminal').innerHTML = '';
+            log('info', 'Latency simulation reset.');
+        }
+
+        function log(type, message) {
+            const term = document.getElementById('terminal');
+            const time = new Date().toLocaleTimeString();
+            const div = document.createElement('div');
+            div.className = 'log-entry';
+            div.innerHTML = `<span class="log-time">[${time}]</span> <span class="log-${type}">[${type.toUpperCase()}]</span> ${message}`;
+            term.appendChild(div);
+            term.scrollTop = term.scrollHeight;
+        }
+
+        window.onload = function() {
+            renderTableData('procedural_strategies');
+        };
+    </script>
+</body>
+</html>
