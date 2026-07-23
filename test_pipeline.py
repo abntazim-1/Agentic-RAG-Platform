@@ -66,7 +66,8 @@ def run():
     # 4. Hybrid retrieval
     print("\n4. Hybrid retrieval...")
     retriever = HybridRetriever(vector_store, bm25_store, embedder, query_rewriter=None)
-    results = retriever.retrieve("how does backpropagation work", top_k=5, use_query_rewriting=False)
+    results, _ = retriever.retrieve("how does backpropagation work", top_k=5, use_query_rewriting=False)
+
     print(f"   Retrieved {len(results)} candidates")
     for r in results:
         print(f"   RRF={r.rrf_score:.4f} | {r.chunk.content[:60]}...")
@@ -86,7 +87,8 @@ def run():
     for r in compressed:
         print(f"   Compressed: {r.chunk.content[:80]}...")
 
-    print("\n✅ Smoke test passed!")
+    print("\n[OK] Smoke test passed!")
+
 
 
 if __name__ == "__main__":
