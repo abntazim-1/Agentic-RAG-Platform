@@ -5,6 +5,7 @@ from functools import lru_cache
 class Settings(BaseSettings):
     # ── API Keys ───────────────────────────────────────────────────────────────
     groq_api_key: str = ""
+    tavily_api_key: str = ""
 
     # ── Models ─────────────────────────────────────────────────────────────────
     embedding_model: str  = "BAAI/bge-m3"
