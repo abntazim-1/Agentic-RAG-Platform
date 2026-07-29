@@ -18,6 +18,7 @@ def stream_query(base_url: str, query: str, session_id: str) -> None:
     print("\nAssistant: ", end="", flush=True)
     sources = []
 
+    has_status = False
     with httpx.stream("POST", url, json=payload, timeout=60) as resp:
         for line in resp.iter_lines():
             if not line or not line.startswith("data: "):
@@ -28,7 +29,14 @@ def stream_query(base_url: str, query: str, session_id: str) -> None:
             except json.JSONDecodeError:
                 continue
 
+            if "status" in data:
+                print(f"\r\033[K⏱️  {data['status']}", end="", flush=True)
+                has_status = True
+
             if "token" in data:
+                if has_status:
+                    print("\r\033[K", end="")
+                    has_status = False
                 print(data["token"], end="", flush=True)
 
             if data.get("done"):
