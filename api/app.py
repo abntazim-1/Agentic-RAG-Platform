@@ -198,59 +198,46 @@ def query_endpoint(req: QueryReq):
 @app.post("/query/stream")
 async def query_stream(req: QueryReq):
     """
-    True token streaming over SSE.
-    Matches mini_rag.py's /query/stream exactly:
-      - Retrieval in thread pool (non-blocking for the event loop)
-      - LLM streaming bridged via asyncio.Queue so sync generator
-        never blocks the uvicorn event loop
+    True token streaming over SSE using the fully Agentic RAG orchestrator loop.
+    Runs the agent execution (guardrails, retrieval, self-RAG check, tool fallback, generation, memory)
+    in a thread pool and bridges events to an asyncio.Queue to avoid blocking.
     """
     loop = asyncio.get_running_loop()
-
-    def _retrieve_only(query: str, session_id: str):
-        history   = memory.get_history(session_id)
-        rewritten = query if not history.strip() else query_rewriter.rewrite(query, history)
-        hits      = list(cached_retrieve_and_rerank(rewritten))
-        return rewritten, hits
-
-    rewritten_q, hits = await loop.run_in_executor(
-        None, _retrieve_only, req.query, req.session_id
-    )
-
-    sources = [
-        {
-            "id":      i + 1,
-            "source":  h.chunk.source,
-            "heading": h.chunk.heading,
-            "score":   round(h.rerank_score if settings.use_reranker else h.rrf_score, 3),
-            "content": h.chunk.content,
-        }
-        for i, h in enumerate(hits)
-    ]
-
-    q: asyncio.Queue = asyncio.Queue(maxsize=32)
+    q: asyncio.Queue = asyncio.Queue(maxsize=64)
     _DONE = object()
 
-    def _stream_to_queue():
+    def _run_orchestrator_stream():
         try:
-            for token in generate_stream(req.query, rewritten_q, hits):
-                loop.call_soon_threadsafe(q.put_nowait, token)
+            for event in orchestrator.run_stream(req.query, session_id=req.session_id):
+                loop.call_soon_threadsafe(q.put_nowait, event)
+        except Exception as e:
+            loop.call_soon_threadsafe(q.put_nowait, {"type": "error", "error": str(e)})
         finally:
             loop.call_soon_threadsafe(q.put_nowait, _DONE)
 
-    full_answer_parts: list[str] = []
-
     async def gen():
-        loop.run_in_executor(None, _stream_to_queue)
+        loop.run_in_executor(None, _run_orchestrator_stream)
+        
+        sources = []
+        rewritten_query = req.query
+        
         while True:
             item = await q.get()
             if item is _DONE:
                 break
-            full_answer_parts.append(item)
-            yield f"data: {json.dumps({'token': item})}\n\n"
-        full_answer = "".join(full_answer_parts).strip()
-        memory.add(req.session_id, "user",      req.query)
-        memory.add(req.session_id, "assistant", full_answer)
-        yield f"data: {json.dumps({'sources': sources, 'done': True})}\n\n"
+                
+            if isinstance(item, dict):
+                if item.get("type") == "token":
+                    yield f"data: {json.dumps({'token': item['token']})}\n\n"
+                elif item.get("type") == "status":
+                    yield f"data: {json.dumps({'status': item['msg'], 'step': item['step']})}\n\n"
+                elif item.get("type") == "error":
+                    yield f"data: {json.dumps({'error': item.get('content') or item.get('error')})}\n\n"
+                elif item.get("type") == "done":
+                    sources = item.get("sources", [])
+                    rewritten_query = item.get("rewritten_query", req.query)
+            
+        yield f"data: {json.dumps({'sources': sources, 'done': True, 'rewritten_query': rewritten_query})}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -508,79 +495,54 @@ def chat_fn(message: str, history: list, session_id: str):
         session_id = str(session_id)
 
     try:
-        t0          = time.time()
-        history_str = legacy_memory.get_history(session_id)
+        status_steps = []
+        answer_parts = []
+        sources = []
+        rewritten_q = message
+        timings = {}
+        trace_id = ""
 
+        # Consume the run_stream generator from the agentic orchestrator
+        for event in orchestrator.run_stream(message, session_id=session_id):
+            if event["type"] == "status":
+                status_steps.append(event["msg"])
+                current_status = "\n".join(f"*{step}*" for step in status_steps)
+                yield f"{current_status}\n\n---"
+                
+            elif event["type"] == "token":
+                answer_parts.append(event["token"])
+                current_status = "\n".join(f"*{step}*" for step in status_steps)
+                current_answer = "".join(answer_parts)
+                yield f"{current_status}\n\n---\n\n{current_answer}"
+                
+            elif event["type"] == "error":
+                yield f"❌ Error: {event.get('content') or event.get('error')}"
+                return
+                
+            elif event["type"] == "done":
+                sources = event.get("sources", [])
+                timings = event.get("timings", {})
+                rewritten_q = event.get("rewritten_query", message)
+                trace_id = event.get("trace_id", "")
 
-        if not history_str.strip():
-            rewritten_q = message
-            rewrite_ms  = 0.0
-        else:
-            t_rw        = time.time()
-            rewritten_q = query_rewriter.rewrite(message, history_str)
-            rewrite_ms  = round(time.time() - t_rw, 2)
-
-        t_ret  = time.time()
-        hits   = list(cached_retrieve_and_rerank(rewritten_q))
-        ret_ms = round(time.time() - t_ret, 3)
-
-        sources = [
-            {
-                "id":      i + 1,
-                "source":  h.chunk.source,
-                "heading": h.chunk.heading,
-                "score":   round(h.rerank_score if settings.use_reranker else h.rrf_score, 3),
-                "content": h.chunk.content,
-            }
-            for i, h in enumerate(hits)
-        ]
-
-        answer_parts: list[str] = []
-        partial   = ""
-        ttft_ms   = None
-        t_stream  = time.time()
-
-        for token in generate_stream(message, rewritten_q, hits):
-            if ttft_ms is None:
-                ttft_ms = round(time.time() - t_stream, 3)
-            answer_parts.append(token)
-            partial = "".join(answer_parts)
-            yield partial
-
-        stream_total_ms = round(time.time() - t_stream, 3)
-        if ttft_ms is None:
-            ttft_ms = 0.0
-
-        answer = partial.strip()
-        gen_ms = round(time.time() - t0, 2)
-
+        answer = "".join(answer_parts).strip()
         if not answer:
             yield "The model returned an empty response. Please try again."
             return
 
-        legacy_memory.add(session_id, "user",      message)
-        legacy_memory.add(session_id, "assistant", answer)
-        three_tier_memory.consolidate_turn(
-            session_id=session_id,
-            trace_id=f"tr-gradio-{uuid.uuid4().hex[:6]}",
-            user_query=message,
-            assistant_response=answer,
-            plan_steps=["gradio_chat", "hybrid_retrieval", "llm_gen"],
-            tool_calls=[],
-            latency_ms=int(gen_ms * 1000),
-            prompt_tokens=150,
-            completion_tokens=len(answer)//4,
-            cost_usd=0.0002
-        )
-
         # ── Footer: timings + rewritten query + sources ──────────────────────
         footer = ""
         timing_parts = []
-        if rewrite_ms:  timing_parts.append(f"Rewrite: {rewrite_ms}s")
-        timing_parts.append(f"Retrieve: {ret_ms}s")
-        timing_parts.append(f"TTFT: {ttft_ms}s")
-        timing_parts.append(f"Generation: {round(stream_total_ms - ttft_ms, 3)}s")
-        timing_parts.append(f"Total: {gen_ms}s")
+        if timings.get("rewrite_ms"):  timing_parts.append(f"Rewrite: {timings['rewrite_ms']}ms")
+        if timings.get("guardrails_ms"): timing_parts.append(f"Guard: {timings['guardrails_ms']}ms")
+        if timings.get("memory_read_ms"): timing_parts.append(f"Mem: {timings['memory_read_ms']}ms")
+        if timings.get("retrieval_total_ms"): timing_parts.append(f"Retrieve: {timings['retrieval_total_ms']}ms")
+        if timings.get("self_rag_ms"): timing_parts.append(f"Self-RAG: {timings['self_rag_ms']}ms")
+        if timings.get("tool_execution_ms"): timing_parts.append(f"Tool: {timings['tool_execution_ms']}ms")
+        if timings.get("ttft_ms"): timing_parts.append(f"TTFT: {timings['ttft_ms']}ms")
+        if timings.get("generation_ms"): timing_parts.append(f"Gen: {timings['generation_ms']}ms")
+        if timings.get("total_latency_ms"): timing_parts.append(f"Total: {timings['total_latency_ms']}ms")
+        
         footer += f"\n\n⏱️ **Timings:** `{'  |  '.join(timing_parts)}`"
 
         if rewritten_q and rewritten_q != message:
@@ -591,16 +553,23 @@ def chat_fn(message: str, history: list, session_id: str):
             for s in sources:
                 footer += f"\n- [{s['id']}] `{s['source']}` (Confidence: {s['score']})"
 
-        yield answer + footer
+        current_status = "\n".join(f"*{step}*" for step in status_steps)
+        yield f"{current_status}\n\n---\n\n{answer}{footer}"
 
-
-        # ── Save to DB ───────────────────────────────────────────────────────
+        # ── Save to DB for Evaluation Dashboard ───────────────────────────────
         from db.database import SessionLocal
         from db.models import QueryMetric
         
         metric_id = str(uuid.uuid4())
         contexts = [s["content"] for s in sources]
         
+        # Convert ms back to seconds for QueryMetric dashboard compatibility
+        rewrite_sec = timings.get("rewrite_ms", 0.0) / 1000.0 if timings.get("rewrite_ms") else None
+        retrieve_sec = timings.get("retrieval_total_ms", 0.0) / 1000.0 if timings.get("retrieval_total_ms") else None
+        ttft_sec = timings.get("ttft_ms", 0.0) / 1000.0 if timings.get("ttft_ms") else None
+        gen_sec = timings.get("generation_ms", 0.0) / 1000.0 if timings.get("generation_ms") else None
+        total_sec = timings.get("total_latency_ms", 0.0) / 1000.0 if timings.get("total_latency_ms") else None
+
         try:
             with SessionLocal() as db:
                 metric = QueryMetric(
@@ -609,11 +578,11 @@ def chat_fn(message: str, history: list, session_id: str):
                     query=message,
                     rewritten_query=rewritten_q,
                     answer=answer,
-                    rewrite_time=rewrite_ms,
-                    retrieve_time=ret_ms,
-                    ttft=ttft_ms,
-                    generation_time=round(stream_total_ms - ttft_ms, 3) if stream_total_ms and ttft_ms else None,
-                    total_time=gen_ms,
+                    rewrite_time=rewrite_sec,
+                    retrieve_time=retrieve_sec,
+                    ttft=ttft_sec,
+                    generation_time=gen_sec,
+                    total_time=total_sec,
                     contexts=contexts
                 )
                 db.add(metric)
