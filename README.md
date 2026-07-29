@@ -149,6 +149,7 @@ Create a `.env` file in the root directory:
 
 ```env
 GROQ_API_KEY=your_groq_api_key_here
+TAVILY_API_KEY=your_tavily_api_key_here  # Optional: For web search tool fallback
 LLM_MODEL=llama-3.3-70b-versatile
 FALLBACK_LLM_MODEL=llama-3.1-8b-instant
 DATABASE_URL=sqlite:///./metrics.db
