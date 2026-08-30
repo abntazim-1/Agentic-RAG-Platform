@@ -45,7 +45,17 @@ class Reranker:
         if not candidates or not settings.use_reranker:
             return candidates[:top_k]
 
-        pairs  = [(query, c.chunk.content) for c in candidates]
+        # Score against heading + content, not content alone. The chunker keeps
+        # the heading out of `content`, so a chunk under "5. Word-by-Word
+        # Text-to-Speech / TTS (Target: 40ms)" whose body never repeats those
+        # words was being scored as irrelevant and dropped — even when dense and
+        # sparse search had both ranked it in their top 3. The reranker is the
+        # last gate, so it needs the same text the retrievers were matched on.
+        pairs  = [
+            (query, f"{c.chunk.heading}\n{c.chunk.content}" if c.chunk.heading
+                    else c.chunk.content)
+            for c in candidates
+        ]
         scores = self.model.predict(pairs)
 
         for rc, score in zip(candidates, scores):

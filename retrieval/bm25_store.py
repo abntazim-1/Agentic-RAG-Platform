@@ -42,6 +42,7 @@ class BM25Store:
         corpus = [
             tokenize(
                 c.content
+                + " " + (c.heading or "")          # heading is searchable too
                 + " " + " ".join(str(k) for k in c.keywords)
                 + " " + (c.summary or "")
                 + " " + " ".join(str(q) for q in c.questions)

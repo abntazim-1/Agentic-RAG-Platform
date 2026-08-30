@@ -107,7 +107,13 @@ class VectorStore:
             return
         points = []
         for c in chunks:
-            texts_to_embed = [c.content]
+            # The heading is the most descriptive line in a section, and the
+            # chunker keeps it out of `content` so it is not repeated in every
+            # chunk. Embed it WITH the body so a question phrased like the
+            # heading ("what is backpropagation?") can match. The payload still
+            # stores `content` untouched, so citations render unchanged.
+            body_text = f"{c.heading}\n{c.content}" if c.heading else c.content
+            texts_to_embed = [body_text]
             if c.summary:     texts_to_embed.append(c.summary)
             if c.questions:   texts_to_embed.extend(c.questions)
 
