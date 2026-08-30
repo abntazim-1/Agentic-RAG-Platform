@@ -537,6 +537,7 @@ def chat_fn(message: str, history: list, session_id: str):
         if timings.get("guardrails_ms"): timing_parts.append(f"Guard: {timings['guardrails_ms']}ms")
         if timings.get("memory_read_ms"): timing_parts.append(f"Mem: {timings['memory_read_ms']}ms")
         if timings.get("retrieval_total_ms"): timing_parts.append(f"Retrieve: {timings['retrieval_total_ms']}ms")
+        if timings.get("retrieval_attempts"): timing_parts.append(f"Attempts: {timings['retrieval_attempts']}")
         if timings.get("self_rag_ms"): timing_parts.append(f"Self-RAG: {timings['self_rag_ms']}ms")
         if timings.get("tool_execution_ms"): timing_parts.append(f"Tool: {timings['tool_execution_ms']}ms")
         if timings.get("ttft_ms"): timing_parts.append(f"TTFT: {timings['ttft_ms']}ms")

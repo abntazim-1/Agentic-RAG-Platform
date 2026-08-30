@@ -19,6 +19,22 @@ class Settings(BaseSettings):
                                                    # token budget on reasoning and returns
                                                    # truncated, unparseable JSON.
 
+    # ── Agent loop ─────────────────────────────────────────────────────────────
+    max_retrieval_attempts: int = 3     # reformulate-and-retry rounds before the
+                                        # web tool is considered. 1 = old one-shot
+                                        # behaviour.
+    use_llm_sufficiency_judge: bool = True   # ask the fast model whether the
+                                             # retrieved context answers the
+                                             # question. False falls back to the
+                                             # raw reranker-score threshold below.
+    self_rag_score_threshold: float = 0.15   # only used when the judge is off or
+                                             # unreachable. NOTE: this compares
+                                             # against a raw cross-encoder logit
+                                             # (range roughly ±11), not a 0-1
+                                             # probability, and against the RRF
+                                             # score when the reranker is off —
+                                             # two scales that are not comparable.
+
     # ── Guardrails ─────────────────────────────────────────────────────────────
     use_prompt_guard: bool = True   # Meta Llama Prompt Guard 2 for injection
                                     # detection. Adds ~390ms per query; set false

@@ -3,6 +3,7 @@ Production-Grade Agentic RAG Orchestrator — Implements a modular ReAct plannin
 with 3-tier memory integration, hybrid retrieval, cross-encoder reranking, Self-RAG reflection,
 tool execution (web search fallback), resilient LLM gateway routing, and granular latency telemetry.
 """
+import json
 import time
 import uuid
 import logging
@@ -89,16 +90,18 @@ class ProductionAgenticOrchestrator:
         return "\n\n".join(parts)
 
     def _execute_web_search_tool(self, query: str) -> List[Dict[str, Any]]:
-        """Invokes external Tavily Web Search API if configured, otherwise falls back to simulation."""
+        """Invokes the Tavily Web Search API if configured.
+
+        Returns [] when no key is set. It previously returned a fabricated
+        "simulated" snippet, which was worse than returning nothing: the caller
+        replaced the real retrieved chunks with that one invented sentence, so a
+        question the documents could answer came back as "I do not have enough
+        information in the context".
+        """
         tavily_key = settings.tavily_api_key
         if not tavily_key:
-            logger.info(f"Tavily API key not configured. Using simulated Web Search fallback for query '{query}'")
-            return [
-                {
-                    "source": "Web Search (Tavily API - Simulated)",
-                    "content": f"Simulated web search snippet for: {query}. Enterprise RAG environments utilize real-time search APIs for dynamic fallback queries."
-                }
-            ]
+            logger.info("Tavily API key not configured — skipping web search tool.")
+            return []
 
         logger.info(f"Invoking Tool: Real Tavily Web Search API for query '{query}'")
         try:
@@ -125,13 +128,167 @@ class ProductionAgenticOrchestrator:
         except Exception as e:
             logger.error(f"Error during Tavily API execution: {e}")
 
-        # Fallback to simulated result if the API call failed
-        return [
-            {
-                "source": "Web Search (Tavily API Failover)",
-                "content": f"Tavily web search lookup failed. Using simulated fallback snippet for query: {query}"
-            }
-        ]
+        # A failed lookup returns nothing rather than an invented snippet.
+        return []
+
+    # ── Reflection ────────────────────────────────────────────────────────────
+
+    def _judge_sufficiency(self, question: str, context: str) -> tuple[bool, str]:
+        """Ask the fast model whether the retrieved context can answer the
+        question. Returns (sufficient, reason).
+
+        This replaces `top_score < 0.15`, which compared against a raw
+        cross-encoder logit — and against the RRF score when the reranker was
+        off, a different scale entirely, so toggling the reranker silently
+        changed how often the fallback fired.
+        """
+        if not context.strip():
+            return False, "no context was retrieved"
+
+        prompt = (
+            "You are checking whether a passage set can answer a question.\n"
+            f"Question: {question}\n\n"
+            f"Context:\n{context[:4000]}\n\n"
+            "Reply with ONLY a JSON object:\n"
+            '{"sufficient": true|false, "reason": "<8 words on what is missing>"}'
+        )
+        try:
+            res = self.llm_gateway.invoke(
+                [HumanMessage(content=prompt)], max_tokens=200,
+                model=settings.metadata_model,
+            ).content
+            start, end = res.find("{"), res.rfind("}") + 1
+            if start != -1 and end != 0:
+                data = json.loads(res[start:end])
+                return bool(data.get("sufficient")), str(data.get("reason", ""))[:120]
+        except Exception as e:
+            logger.warning(f"Sufficiency judge failed ({e}); falling back to score threshold.")
+        return None, "judge unavailable"
+
+    def _reformulate(self, original: str, tried: List[str], reason: str) -> str:
+        """Rewrite the query for another retrieval attempt, told what was missing."""
+        prompt = (
+            "A document search did not find enough to answer this question.\n"
+            f"Question: {original}\n"
+            f"Queries already tried: {'; '.join(tried)}\n"
+            f"What was missing: {reason}\n\n"
+            "Write ONE different search query likely to surface the missing "
+            "information. Use different wording and likely synonyms or section "
+            "titles. Output ONLY the query."
+        )
+        try:
+            out = self.llm_gateway.invoke(
+                [HumanMessage(content=prompt)], max_tokens=120,
+                model=settings.metadata_model,
+            ).content.strip().strip('"')
+            return out or original
+        except Exception as e:
+            logger.warning(f"Reformulation failed ({e}); reusing original query.")
+            return original
+
+    # ── The agent loop ────────────────────────────────────────────────────────
+
+    def _retrieval_loop(self, query: str, timings: Dict[str, float],
+                        plan_steps: List[str], tool_calls: List[Dict[str, Any]]):
+        """Retrieve, judge, and retry with a reformulated query until the context
+        is sufficient or the attempt budget runs out; then optionally call the
+        web tool.
+
+        This is a generator so the streaming and non-streaming paths share one
+        implementation: `run_stream` does `yield from` to surface progress, and
+        `run` drains it silently. Returns (hits, queries_tried, used_web).
+        """
+        attempts     = max(1, settings.max_retrieval_attempts)
+        current      = query
+        tried        = []
+        # Evidence ACCUMULATES across attempts, keyed by chunk id and keeping the
+        # best score seen. Replacing `hits` each round meant a good chunk found on
+        # attempt 1 was discarded if a later reformulation retrieved worse ones —
+        # observed in testing, where a query answered on attempt 1 went on to
+        # retry and ended up carrying the weaker set into generation.
+        pool: Dict[str, RetrievedChunk] = {}
+        hits         = []
+        sufficient   = False
+        reason       = ""
+        t_loop       = time.time()
+
+        for attempt in range(attempts):
+            if attempt > 0:
+                yield {"type": "status", "step": "reformulate",
+                       "msg": f"🔁 Context insufficient ({reason}). Rephrasing and searching again..."}
+                current = self._reformulate(query, tried, reason)
+                plan_steps.append(f"query_reformulated_{attempt}")
+
+            tried.append(current)
+            yield {"type": "status", "step": "retrieval",
+                   "msg": f"📡 Searching document database (attempt {attempt + 1}/{attempts})..."}
+
+            for rc in self.cached_retriever(current):
+                prior = pool.get(rc.chunk.id)
+                if prior is None or rc.rerank_score > prior.rerank_score:
+                    pool[rc.chunk.id] = rc
+            hits = sorted(pool.values(), key=lambda x: -x.rerank_score)[:settings.top_k_rerank]
+            plan_steps.append(f"retrieval_attempt_{attempt + 1}")
+
+            yield {"type": "status", "step": "self_rag",
+                   "msg": "🤖 Evaluating whether the context answers the question..."}
+            t_judge = time.time()
+            verdict = None
+            if settings.use_llm_sufficiency_judge:
+                # Judge the accumulated evidence, not just this round's, since
+                # that is what generation will actually see.
+                verdict, reason = self._judge_sufficiency(query, self._build_context(hits))
+
+            if verdict is None:
+                # Judge disabled or unreachable — fall back to the score threshold.
+                top = hits[0].rerank_score if hits and settings.use_reranker else (
+                      hits[0].rrf_score if hits else 0.0)
+                verdict = top >= settings.self_rag_score_threshold
+                reason  = f"top score {top:.2f} below threshold"
+
+            # Cumulative reflection cost across every attempt in this loop.
+            timings["self_rag_ms"] = round(
+                timings.get("self_rag_ms", 0.0) + (time.time() - t_judge) * 1000, 2
+            )
+
+            if verdict:
+                sufficient = True
+                plan_steps.append("context_verified")
+                break
+
+        timings["retrieval_loop_ms"] = round((time.time() - t_loop) * 1000, 2)
+        timings["retrieval_attempts"] = len(tried)
+
+        # ── Tool: web search, only after retries are exhausted ────────────────
+        used_web = False
+        if not sufficient:
+            t_tool = time.time()
+            yield {"type": "status", "step": "web_search",
+                   "msg": "🌐 Documents insufficient. Trying web search..."}
+            web = self._execute_web_search_tool(query)
+            timings["tool_execution_ms"] = round((time.time() - t_tool) * 1000, 2)
+            if web:
+                used_web = True
+                tool_calls.append({"tool": "tavily_web_search", "query": query,
+                                   "results_count": len(web)})
+                plan_steps.append("tool_web_search_executed")
+                # Web results are APPENDED to the document chunks, not swapped in.
+                # Replacing them meant a weak-but-correct local answer was thrown
+                # away in favour of whatever the tool returned.
+                for i, r in enumerate(web):
+                    hits.append(RetrievedChunk(
+                        chunk=Chunk(id=f"web-{i}", content=r["content"],
+                                    source=r["source"], heading="Web Search Result"),
+                        rrf_score=1.0, rerank_score=1.0,
+                    ))
+            else:
+                plan_steps.append("web_search_unavailable")
+                yield {"type": "status", "step": "web_search",
+                       "msg": "⚠️ No web search configured — answering from documents alone."}
+        else:
+            timings.setdefault("tool_execution_ms", 0.0)
+
+        return hits, tried, used_web
 
 
     def run(self, query: str, session_id: str = "default_session", user_id: str = "default_user") -> OrchestratorResponse:
@@ -200,43 +357,21 @@ class ProductionAgenticOrchestrator:
         span_rw.finish()
         plan_steps.append("query_rewritten")
 
-        # ── Step 4: Hybrid RAG Retrieval (Dense + Sparse) & Rerank Latency ──────
+        # ── Step 4+5: Retrieve → judge → reformulate → retry → optional tool ───
+        # Shared with run_stream() via the same generator, so the two paths
+        # cannot drift apart. Status events are drained and discarded here.
         t_ret = time.time()
-        span_ret = tracer.start_span("hybrid_retrieval", trace_id=trace_id, parent_id=root_span.span_id)
-        
-        # Track dense vs sparse search latencies
-        t_dense_start = time.time()
-        q_vec = self.retriever.embedder.embed_query(rewritten_query)
-        dense_results = self.retriever.vector_store.search(q_vec, settings.top_k_retrieval)
-        timings["dense_search_ms"] = round((time.time() - t_dense_start) * 1000, 2)
+        span_ret = tracer.start_span("retrieval_loop", trace_id=trace_id, parent_id=root_span.span_id)
 
-        t_sparse_start = time.time()
-        sparse_results = self.retriever.bm25_store.search(rewritten_query, settings.top_k_retrieval)
-        timings["sparse_search_ms"] = round((time.time() - t_sparse_start) * 1000, 2)
+        loop = self._retrieval_loop(rewritten_query, timings, plan_steps, tool_calls)
+        try:
+            while True:
+                next(loop)
+        except StopIteration as stop:
+            hits, queries_tried, used_web = stop.value
 
-        hits = list(self.cached_retriever(rewritten_query))
         timings["retrieval_total_ms"] = round((time.time() - t_ret) * 1000, 2)
         span_ret.finish()
-        plan_steps.append("hybrid_retrieval_complete")
-
-        # ── Step 5: Self-RAG Relevance Evaluation & Tool Fallback Latency ────
-        t_eval = time.time()
-        span_eval = tracer.start_span("self_rag_eval", trace_id=trace_id, parent_id=root_span.span_id)
-        top_score = hits[0].rerank_score if hits and settings.use_reranker else (hits[0].rrf_score if hits else 0.0)
-        
-        tool_latency_ms = 0.0
-        if top_score < 0.15:
-            t_tool = time.time()
-            tool_res = self._execute_web_search_tool(rewritten_query)
-            tool_calls.append({"tool": "tavily_web_search", "query": rewritten_query, "results_count": len(tool_res)})
-            tool_latency_ms = round((time.time() - t_tool) * 1000, 2)
-            plan_steps.append("tool_web_search_executed")
-        else:
-            plan_steps.append("self_rag_verified")
-            
-        timings["self_rag_ms"] = round((time.time() - t_eval) * 1000, 2)
-        timings["tool_execution_ms"] = tool_latency_ms
-        span_eval.finish()
 
         # ── Step 6: Context Assembly & Resilient LLM Generation Latency ──────
         t_gen = time.time()
@@ -379,67 +514,22 @@ class ProductionAgenticOrchestrator:
         span_rw.finish()
         plan_steps.append("query_rewritten")
 
-        # ── Step 4: Hybrid RAG Retrieval (Dense + Sparse) & Rerank Latency ──────
-        yield {"type": "status", "step": "retrieval", "msg": "📡 Searching document database (Dense + Sparse RRF)..."}
+        # ── Step 4+5: Retrieve → judge → reformulate → retry → optional tool ───
+        # Same generator as run(); `yield from` surfaces each attempt to the UI.
         t_ret = time.time()
-        span_ret = tracer.start_span("hybrid_retrieval", trace_id=trace_id, parent_id=root_span.span_id)
-        
-        # Track dense vs sparse search latencies
-        t_dense_start = time.time()
-        q_vec = self.retriever.embedder.embed_query(rewritten_query)
-        dense_results = self.retriever.vector_store.search(q_vec, settings.top_k_retrieval)
-        timings["dense_search_ms"] = round((time.time() - t_dense_start) * 1000, 2)
+        span_ret = tracer.start_span("retrieval_loop", trace_id=trace_id, parent_id=root_span.span_id)
 
-        t_sparse_start = time.time()
-        sparse_results = self.retriever.bm25_store.search(rewritten_query, settings.top_k_retrieval)
-        timings["sparse_search_ms"] = round((time.time() - t_sparse_start) * 1000, 2)
+        hits, queries_tried, used_web_search = yield from self._retrieval_loop(
+            rewritten_query, timings, plan_steps, tool_calls
+        )
 
-        hits = list(self.cached_retriever(rewritten_query))
         timings["retrieval_total_ms"] = round((time.time() - t_ret) * 1000, 2)
         span_ret.finish()
-        plan_steps.append("hybrid_retrieval_complete")
-
-        # ── Step 5: Self-RAG Relevance Evaluation & Tool Fallback Latency ────
-        yield {"type": "status", "step": "self_rag", "msg": "🤖 Evaluating context relevance (Self-RAG)..."}
-        t_eval = time.time()
-        span_eval = tracer.start_span("self_rag_eval", trace_id=trace_id, parent_id=root_span.span_id)
-        top_score = hits[0].rerank_score if hits and settings.use_reranker else (hits[0].rrf_score if hits else 0.0)
-        
-        tool_latency_ms = 0.0
-        used_web_search = False
-        web_hits = []
-        if top_score < 0.15:
-            yield {"type": "status", "step": "web_search", "msg": "🌐 Low context confidence. Invoking Tavily Web Search fallback..."}
-            t_tool = time.time()
-            tool_res = self._execute_web_search_tool(rewritten_query)
-            used_web_search = True
-            tool_calls.append({"tool": "tavily_web_search", "query": rewritten_query, "results_count": len(tool_res)})
-            tool_latency_ms = round((time.time() - t_tool) * 1000, 2)
-            plan_steps.append("tool_web_search_executed")
-            
-            # Map tool_res to RetrievedChunks to construct context easily
-            for r_idx, r in enumerate(tool_res):
-                web_hits.append(
-                    RetrievedChunk(
-                        chunk=Chunk(
-                            id=f"web-{r_idx}",
-                            content=r["content"],
-                            source=r["source"],
-                            heading="Web Search Result"
-                        ),
-                        rrf_score=1.0,
-                        rerank_score=1.0
-                    )
-                )
-        else:
-            plan_steps.append("self_rag_verified")
-            
-        timings["self_rag_ms"] = round((time.time() - t_eval) * 1000, 2)
-        timings["tool_execution_ms"] = tool_latency_ms
-        span_eval.finish()
 
         # Assemble Context
-        context_hits = web_hits if used_web_search else hits
+        # `hits` already carries any web results, appended by the retrieval loop
+        # rather than substituted for the document chunks.
+        context_hits = hits
         context_str = self._build_context(context_hits)
         user_prompt = f"Context:\n{context_str}\n\nQuestion: {rewritten_query}\n\nAnswer:"
 

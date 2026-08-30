@@ -68,13 +68,19 @@ class ResilientLLMGateway:
         self,
         messages: List[BaseMessage],
         temperature: float = 0.0,
-        max_tokens: int = 512
+        max_tokens: int = 512,
+        model: Optional[str] = None,
     ) -> LLMResponse:
         """
         Executes LLM invocation with automatic multi-provider fallback routing.
         If primary model hits rate-limits (HTTP 429/503), it automatically reroutes.
+
+        `model` overrides the primary for this call — used by the agent loop's
+        sufficiency judge and query reformulator, which are small classification
+        and rewriting jobs that do not need the large generation model.
         """
-        models_to_try = [self.primary_model] + self.fallback_models
+        first = model or self.primary_model
+        models_to_try = [first] + [m for m in self.fallback_models if m != first]
         last_exception = None
         t0 = time.time()
 

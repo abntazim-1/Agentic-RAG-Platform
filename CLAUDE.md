@@ -81,9 +81,11 @@ memory consolidation. **The orchestrator is what actually serves traffic** — `
 `/query/stream`, and the Gradio chat all call it. The graph's `run` survives only to back
 `/evaluate`.
 
-The step sequence and every timing key are in [orchestrator.py:137](agent/orchestrator.py:137)
-(`run`) and [:311](agent/orchestrator.py:311) (`run_stream`). These two are near-duplicates —
-a change to one almost always needs the same change to the other.
+`run` and `run_stream` now share `_retrieval_loop()` — a generator that yields status
+events and returns `(hits, queries_tried, used_web)`. `run_stream` does `yield from` to
+surface progress; `run` drains it and reads `StopIteration.value`. Retrieval, reflection,
+retry and tool logic therefore exist once. The steps around it (guardrails, memory,
+rewrite, generation, consolidation) are still duplicated between the two.
 
 [agent/multi_agent.py](agent/multi_agent.py) is unreferenced dead code (see the bug note
 below).
@@ -102,6 +104,11 @@ is called once in [graph.py:107](agent/graph.py:107) (bound to `cached_retrieve_
 a repeated query can return pre-ingest results until restart. If you touch ingestion, clear
 both.
 
+**Evidence accumulates across retry attempts.** `_retrieval_loop` keeps a pool keyed by
+chunk id with the best score seen, so a chunk found on attempt 1 is not lost when a later
+reformulation retrieves worse ones. The judge scores the accumulated pool, since that is
+what generation receives.
+
 **Telemetry numbers are estimates, not measurements.**
 [observability/tracer.py](observability/tracer.py) is a hand-rolled span logger named after
 OpenTelemetry, not the OTel SDK — no exporter, no collector; spans log and drop.
@@ -110,11 +117,14 @@ so token counts and every USD figure derived from them are approximations rather
 reported usage. TTFT in `run()` is literally `generation_ms * 0.35`
 ([orchestrator.py:250](agent/orchestrator.py:250)).
 
-**The Self-RAG web-search trigger is a bare threshold**: `top_score < 0.15` against the
-reranker score, or the RRF score when the reranker is off. Those two scales are not
-comparable, so flipping `use_reranker` silently changes how often the Tavily tool fires. With
-no `TAVILY_API_KEY`, `_execute_web_search_tool` returns a hardcoded *simulated* snippet
-instead of failing — easy to mistake for a real search result.
+**Sufficiency is judged by the model, not a threshold.** `_judge_sufficiency()` asks
+`metadata_model` whether the retrieved context answers the question and returns a reason.
+`self_rag_score_threshold` (0.15) survives only as the fallback when the judge is disabled
+or unreachable — and it still compares a raw cross-encoder logit against the RRF score when
+`use_reranker` is off, two scales that are not comparable. With no `TAVILY_API_KEY`,
+`_execute_web_search_tool` now returns `[]`; it used to fabricate a "simulated" snippet
+that then *replaced* the real chunks, turning answerable questions into "I do not have
+enough information". Web results are appended to the document chunks, never substituted.
 
 **Ingestion calls the LLM once per chunk.** With `generate_metadata=True`, `MetadataEnricher`
 runs over every chunk through `metadata_model` on `metadata_workers` threads. It dominates
