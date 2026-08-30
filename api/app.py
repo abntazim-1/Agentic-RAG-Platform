@@ -52,7 +52,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import get_settings
 from models import QueryRequest, QueryResponse
 from ingestion.loaders import load_directory, load_file
-from ingestion.chunker import StructureAwareChunker
+from ingestion.chunker import SemanticChunker
 from ingestion.metadata import MetadataEnricher
 from retrieval.embedder import Embedder
 from retrieval.vector_store import VectorStore
@@ -159,7 +159,7 @@ def ingest(req: IngestReq):
             detail=f"Source '{req.source}' is already indexed. Delete it first or use a unique source name.",
         )
     try:
-        chunker  = StructureAwareChunker()
+        chunker  = SemanticChunker(embedder=embedder)
         enricher = MetadataEnricher()
 
         # Build a Document-like object for the chunker
@@ -277,7 +277,7 @@ def ingest_path(path: str, save_index: bool = True):
     else:
         docs = [load_file(path)]
 
-    chunker  = StructureAwareChunker()
+    chunker  = SemanticChunker(embedder=embedder)
     enricher = MetadataEnricher()
     all_chunks = []
     for doc in docs:
@@ -399,7 +399,7 @@ def ingest_file(files) -> str:
         try:
             from models import Document
             doc    = Document(content=text, source=source_name)
-            chunker  = StructureAwareChunker()
+            chunker  = SemanticChunker(embedder=embedder)
             enricher = MetadataEnricher()
             chunks = chunker.chunk(doc)
             chunks = enricher.enrich_batch(chunks)

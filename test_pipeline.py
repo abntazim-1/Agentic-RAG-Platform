@@ -5,7 +5,7 @@ Does NOT require Groq API (skips LLM steps if key is missing).
 """
 import os
 from models import Document
-from ingestion.chunker import StructureAwareChunker
+from ingestion.chunker import SemanticChunker
 from retrieval.embedder import Embedder
 from retrieval.vector_store import VectorStore
 from retrieval.bm25_store import BM25Store
@@ -43,18 +43,21 @@ ReLU is defined as f(x) = max(0, x).
 def run():
     print("=== RAG Pipeline Smoke Test ===\n")
 
+    # 0. Embedder — needed by the semantic chunker, so it loads first
+    print("0. Loading embedder...")
+    embedder = Embedder()
+
     # 1. Chunking
-    print("1. Chunking...")
+    print("\n1. Chunking...")
     doc = Document(content=SAMPLE_TEXT, source="sample.md")
-    chunker = StructureAwareChunker(chunk_size=256)
+    chunker = SemanticChunker(embedder=embedder, chunk_size=600)
     chunks = chunker.chunk(doc)
     print(f"   Produced {len(chunks)} chunks")
     for c in chunks:
         print(f"   [{c.chunk_type}] heading={c.heading!r} | {c.content[:60]}...")
 
-    # 2. Embedding
-    print("\n2. Embedding...")
-    embedder = Embedder()
+    # 2. Indexing
+    print("\n2. Indexing...")
     vector_store = VectorStore(embedder)
     vector_store.add(chunks)
 
