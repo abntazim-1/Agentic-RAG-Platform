@@ -1,6 +1,6 @@
 # Production-Grade Agentic RAG Platform
 
-A state-of-the-art, enterprise-ready **Agentic Retrieval-Augmented Generation (RAG)** platform featuring a **3-Tier Memory Architecture**, **ReAct Agentic Orchestrator**, **Resilient Multi-Provider LLM Gateway**, **Sub-Process Latency Instrumentation**, and a **Real-Time Database Inspector Dashboard** — served as a unified FastAPI application and embedded Gradio UI.
+A state-of-the-art, enterprise-ready **Agentic Retrieval-Augmented Generation (RAG)** platform featuring a **3-Tier Memory Architecture**, **Self-RAG Reflection Loop**, **Resilient Multi-Provider LLM Gateway**, **Sub-Process Latency Instrumentation**, and a **Real-Time Database Inspector Dashboard** — served as a unified FastAPI application and embedded Gradio UI.
 
 ---
 
@@ -20,10 +20,10 @@ A state-of-the-art, enterprise-ready **Agentic Retrieval-Augmented Generation (R
                                                 │
                                                 ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                 Agentic ReAct Orchestrator                                   │
+│                                    Agent Orchestrator                                        │
 │  • Input Guardrails (Llama Prompt Guard 2 injection classifier)                              │
-│  • Self-RAG Context Verification & Reflection                                                │
-│  • Automated Web Search Fallback (Tavily Tool)                                               │
+│  • Retrieve → judge sufficiency → reformulate → retry  (loop, up to 3 attempts)              │
+│  • Web Search Tool (Tavily) once retries are exhausted — appended, not substituted           │
 └──────────────────────┬────────────────────────┬────────────────────────┬─────────────────────┘
                        │                        │                        │
                        ▼                        ▼                        ▼
@@ -82,15 +82,49 @@ A state-of-the-art, enterprise-ready **Agentic Retrieval-Augmented Generation (R
 
 ### 1. 🧠 3-Tier Enterprise Memory Architecture
 * **Short-Term Working Memory**: Preserves active conversational context, turn histories, and scratchpad execution states per session.
-* **Long-Term Semantic Memory**: Extracts and stores subject-predicate-object knowledge triples and user facts in persistent relational tables.
-* **Episodic Trace Memory**: Captures complete execution trajectories, step plans, tool calls, final responses, and token costs for auditability.
-* **Procedural Memory**: Learns and indexes successful workflow strategies and execution DAGs for automated query planning.
+* **Long-Term Semantic Memory**: Schema and API for subject-predicate-object knowledge triples per user.
+* **Episodic Trace Memory**: Captures execution traces — the steps that ran, tool calls, final responses and token estimates — for auditability. Recorded after the fact; a log, not a plan that drove execution.
+* **Procedural Memory**: Schema for workflow strategies and execution DAGs, seeded with three defaults at first startup.
 
-### 2. 🤖 Agentic ReAct Orchestrator & Self-RAG
-* **Dynamic Planning & Reasoning**: Decomposes complex queries into actionable step plans.
-* **Self-RAG Reflection**: Evaluates whether retrieved document contexts contain sufficient evidence to answer the query.
-* **Web Search Fallback**: Automatically invokes external search tools (e.g. Tavily API) if internal vector knowledge is insufficient.
-* **Failure Recovery**: Self-corrects and reroutes queries on low confidence or execution failures.
+> **Which tiers are actually wired into the query path.** Working and Episodic
+> are live: every turn reads recent history and writes a full trace. Semantic and
+> Procedural are **not** — `get_semantic_facts()` is called each query but nothing
+> ever writes a fact and the result never reaches the prompt, and
+> `get_procedural_strategy()` has no call sites at all. The tables, models and
+> methods exist; connecting them to the loop is outstanding work.
+
+### 2. 🤖 Agent Loop — Retrieve, Reflect, Retry
+
+Retrieval is a loop, not a single pass:
+
+```
+        ┌──────────────────────────────────────────────┐
+        ▼                                              │
+   hybrid retrieve  ──►  judge: does this answer it?   │
+                              │         │              │
+                        yes ◄─┘         └─► no ────────┘
+                         │                   reformulate using
+                         │                   WHY it fell short
+                         ▼                   (up to MAX_RETRIEVAL_ATTEMPTS)
+                      generate                        │
+                         ▲                            │
+                         └──── append web results ◄───┘  attempts exhausted
+```
+
+* **Model-judged sufficiency**: a fast model reads the retrieved context, decides whether it answers the question, and states what is missing. That reason is fed into the next query, so a retry is informed rather than a blind repeat.
+* **Accumulating evidence**: hits are pooled across attempts by chunk id, keeping the best score seen, so a good chunk found on attempt 1 is not lost when a later reformulation retrieves worse ones. The judge scores the pool, since that is what generation receives.
+* **Web search as last resort**: the Tavily tool runs only after the retry budget is spent, and its results are **appended** to the document chunks, never substituted for them.
+* **Failure recovery**: the LLM gateway fails over across three models; the guardrail classifier fails open to regex; an unconfigured web tool returns nothing rather than a placeholder.
+
+> **What it does not do.** It does not decompose a question into sub-questions.
+> "Compare the TTS latency to the STT latency" needs two retrievals and gets one
+> loop over a single query. `plan_steps` in the trace is a log of what happened,
+> not a plan that drove it.
+
+**Cost of reflection:** a simple query is ~3.1s (1 attempt); one needing a retry
+is ~5.7s; exhausting three attempts is ~6.3s. Set `MAX_RETRIEVAL_ATTEMPTS=1` for
+the old single-pass latency, or `USE_LLM_SUFFICIENCY_JUDGE=false` to fall back to
+a score threshold.
 
 ### 3. 🛡️ Resilient Multi-Provider LLM Gateway
 * **Automated Failover**: Primary model (`openai/gpt-oss-120b`) falling back through `qwen/qwen3.8-27b` and `openai/gpt-oss-20b` on error or rate limit.
@@ -157,7 +191,7 @@ The check **fails open** — an unreachable classifier degrades to the regex res
 | **Sparse Search** | BM25 (`rank-bm25` keyword retrieval, rebuilt in memory at startup) |
 | **Fusion & Ranking** | Reciprocal Rank Fusion (RRF, `k=60`) |
 | **Guardrails** | `meta-llama/llama-prompt-guard-2-86m` + narrow regex pre-filter |
-| **Orchestration** | ReAct Agentic Orchestrator + LangGraph |
+| **Orchestration** | Self-RAG style reflect-and-retry loop + LangGraph |
 | **Memory Database** | SQLite via SQLAlchemy ORM (path hardcoded; Postgres not wired) |
 | **Telemetry** | In-process span logger with per-stage millisecond timings |
 | **API & Web UI** | FastAPI + Gradio 3-Tab Interface (Chat, Add Knowledge, System Dashboard) |
@@ -209,6 +243,12 @@ TOP_K_RERANK=5
 # Chunking (semantic)
 CHUNK_SIZE=1000                          # max characters of new content per chunk
 CHUNK_OVERLAP_RATIO=0.175                # honoured as a 15-20% band
+
+# Agent loop
+MAX_RETRIEVAL_ATTEMPTS=3                 # reformulate-and-retry rounds; 1 = single pass
+USE_LLM_SUFFICIENCY_JUDGE=true           # false falls back to SELF_RAG_SCORE_THRESHOLD
+SELF_RAG_SCORE_THRESHOLD=0.15            # fallback only — a raw cross-encoder logit,
+                                         # not a 0-1 probability
 
 # Guardrails
 USE_PROMPT_GUARD=true                    # Llama Prompt Guard 2; ~380ms per query
@@ -296,7 +336,7 @@ Open your browser at **[http://localhost:8000/](http://localhost:8000/)**:
 ```
 Agentic-RAG-Platform/
 ├── agent/
-│   ├── orchestrator.py      # ReAct agentic orchestrator loop & Self-RAG check (serves all traffic)
+│   ├── orchestrator.py      # Agent loop: retrieve, judge, reformulate, retry (serves all traffic)
 │   ├── graph.py             # LangGraph rewrite→retrieve→generate pipeline (backs /evaluate only)
 │   └── multi_agent.py       # Unreferenced; kept for reference
 ├── ingestion/
