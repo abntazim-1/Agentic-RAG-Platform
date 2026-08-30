@@ -10,4 +10,5 @@ qdrant_db/
 .DS_Store
 cv_bullets.md 
 *.db
-docs/
+docs/
+qdrant_db.backup/

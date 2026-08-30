@@ -13,7 +13,12 @@ from config import get_settings
 logger = logging.getLogger("LLMGateway")
 settings = get_settings()
 
-# Cost estimates per 1,000,000 tokens
+# Cost estimates per 1,000,000 tokens.
+# STALE: these are the retired llama models. The current models (gpt-oss-120b,
+# qwen3.8-27b, gpt-oss-20b) are not listed, so they fall through to the generic
+# default below. Every figure here is doubly approximate anyway, because token
+# counts come from _estimate_tokens() (len // 4), not from the provider's usage
+# response. Populate from Groq's pricing page if cost reporting needs to be real.
 MODEL_PRICING = {
     "llama-3.3-70b-versatile": {"input": 0.59, "output": 0.79},
     "llama-3.1-8b-instant": {"input": 0.05, "output": 0.08},
@@ -44,7 +49,10 @@ class LLMResponse:
 class ResilientLLMGateway:
     def __init__(self):
         self.primary_model = settings.llm_model
-        self.fallback_models = [settings.metadata_model, "llama-3.1-8b-instant"]
+        # The last entry used to be a hardcoded "llama-3.1-8b-instant", which was
+        # both retired by Groq AND a duplicate of metadata_model — so the
+        # "resilient failover" had exactly one real fallback, to a dead model.
+        self.fallback_models = [settings.metadata_model, "openai/gpt-oss-20b"]
         self.groq_api_key = settings.groq_api_key or os.getenv("GROQ_API_KEY", "")
 
     def _estimate_tokens(self, text_str: str) -> int:
