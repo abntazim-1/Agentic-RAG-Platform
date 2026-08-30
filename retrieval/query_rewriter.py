@@ -6,6 +6,8 @@ not the heavy main LLM — matches mini_rag.py's rewrite_query() exactly.
 
 On first-turn queries (no history) rewriting is skipped entirely.
 """
+import os
+
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage
 from config import get_settings
@@ -15,11 +17,14 @@ settings = get_settings()
 
 class QueryRewriter:
     def __init__(self):
-        # Use the fast metadata model — matches mini_rag.py
+        # Use the fast metadata model — matches mini_rag.py.
+        # Key comes from settings, not the ambient env var, so this constructs
+        # outside of api/app.py's load_dotenv() context too.
         self.llm = ChatGroq(
             model=settings.metadata_model,
             temperature=0,
             max_tokens=settings.metadata_max_tokens,
+            groq_api_key=settings.groq_api_key or os.getenv("GROQ_API_KEY", ""),
         )
 
     def rewrite(self, query: str, history: str = "") -> str:
